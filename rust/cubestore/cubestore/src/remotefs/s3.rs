@@ -4,6 +4,8 @@ use crate::remotefs::{CommonRemoteFsUtils, LocalDirRemoteFs, RemoteFile, RemoteF
 use crate::util::lock::acquire_lock;
 use crate::CubeError;
 use async_trait::async_trait;
+use aws_sdk_sts::model::{AssumeRoleRequest, Credentials};
+use aws_sdk_sts::{Client, Config, Region};
 use chrono::{DateTime, Utc};
 use datafusion::cube_ext;
 use log::{debug, info};
@@ -20,10 +22,8 @@ use tempfile::{NamedTempFile, PathPersistError};
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
 use tokio::spawn;
-use aws_sdk_sts::{Client, Config, Region};
-use aws_sdk_sts::model::{AssumeRoleRequest, Credentials};
+use tokio::sync::Mutex;
 
 pub struct S3RemoteFs {
     dir: PathBuf,
@@ -58,18 +58,16 @@ impl S3RemoteFs {
                 err.to_string()
             ))
         })?;
-    
+
         let role_name = env::var("CUBESTORE_AWS_IAM_ROLE").ok();
         let (access_key, secret_key) = match role_name {
-            Some(role_name) => {
-                assume_role(&role_name, &region.to_string()).await
-            }
+            Some(role_name) => assume_role(&role_name, &region.to_string()).await,
             None => (
                 env::var("CUBESTORE_AWS_ACCESS_KEY_ID").ok(),
                 env::var("CUBESTORE_AWS_SECRET_ACCESS_KEY").ok(),
             ),
         }?;
-    
+
         let credentials = Credentials::new(
             access_key.as_deref(),
             secret_key.as_deref(),
@@ -90,7 +88,7 @@ impl S3RemoteFs {
             sub_path,
             delete_mut: Mutex::new(()),
         });
-    
+
         spawn_creds_refresh_loop(
             role_name.or(access_key.clone()),
             role_name.is_some(),
@@ -98,7 +96,7 @@ impl S3RemoteFs {
             region,
             &fs,
         );
-    
+
         Ok(fs)
     }
 }
@@ -115,18 +113,27 @@ async fn assume_role(
         .account;
 
     let assume_role_output = Client::new(Config::builder().region(Region::new(region)).build())
-        .assume_role(AssumeRoleRequest::builder()
-            .role_arn(format!("arn:aws:iam::{}:role/{}", account_id, role_or_access_key))
-            .duration_seconds(28800)
-            .build())
+        .assume_role(
+            AssumeRoleRequest::builder()
+                .role_arn(format!(
+                    "arn:aws:iam::{}:role/{}",
+                    account_id, role_or_access_key
+                ))
+                .duration_seconds(28800)
+                .build(),
+        )
         .send()
         .await
         .map_err(|e| CubeError::internal(format!("Failed to assume role: {}", e)))?
         .credentials
         .ok_or_else(|| CubeError::internal("Failed to get credentials".to_string()))?;
 
-    let access_key = assume_role_output.access_key_id.ok_or_else(|| CubeError::internal("Failed to get access key".to_string()))?;
-    let secret_key = assume_role_output.secret_access_key.ok_or_else(|| CubeError::internal("Failed to get secret key".to_string()))?;
+    let access_key = assume_role_output
+        .access_key_id
+        .ok_or_else(|| CubeError::internal("Failed to get access key".to_string()))?;
+    let secret_key = assume_role_output
+        .secret_access_key
+        .ok_or_else(|| CubeError::internal("Failed to get secret key".to_string()))?;
 
     Ok((access_key, secret_key))
 }
@@ -158,7 +165,8 @@ fn spawn_creds_refresh_loop(
             };
 
             let (access_key, secret_key) = if is_role {
-                let (access_key, secret_key) = assume_role(&role_or_access_key.as_ref().unwrap(), &region.to_string()).await;
+                let (access_key, secret_key) =
+                    assume_role(&role_or_access_key.as_ref().unwrap(), &region.to_string()).await;
                 (Some(access_key), Some(secret_key))
             } else {
                 let secret_key = env::var("CUBESTORE_AWS_SECRET_ACCESS_KEY").ok();
